@@ -2,58 +2,102 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.99-CE422B?logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](#build)
-[![E2E](https://img.shields.io/badge/e2e-byte--identical%20download-brightgreen)](#build)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](#build--test)
+[![E2E](https://img.shields.io/badge/e2e-byte--identical%20download-brightgreen)](#build--test)
 
-**Ferrite** is a from-scratch BitTorrent client written in Rust, designed as a systems/distributed-systems portfolio project rather than a wrapper around an existing torrent library.
+**Ferrite** is a from-scratch BitTorrent client in Rust — no libtorrent, no
+transmission bindings. It implements the peer wire protocol, tracker
+announces, rarest-first piece selection, and DHT peer discovery by hand, as
+a systems and distributed-systems portfolio project.
 
-> Educational software. Only use it with content you are legally allowed to download and share.
+> Educational software. Only use it with content you are legally allowed to
+> download and share.
 
-## What is implemented
+## Demo
 
-### Core protocol
-- Bencode decoder/encoder with recursive dictionaries/lists and validation
-- `.torrent` metadata parsing
-- Exact bencoded `info` dictionary hashing for the 20-byte SHA-1 info-hash
-- HTTP tracker announce with compact peer-list decoding
-- BitTorrent peer handshake
-- Peer wire messages: keep-alive, choke, unchoke, interested, not-interested, have, bitfield, request, piece, cancel, port
-- Concurrent TCP peer sessions using Tokio
-- Piece verification using SHA-1
-- 16 KiB block requests
-- Multi-file torrent path mapping
-- Rarest-first selection based on observed peer availability
-- Peer timeouts and failure isolation
+Inspect a torrent:
 
-### Distributed-systems extension
-- UDP DHT client
-- Kademlia-style `get_peers` queries
-- Compact IPv4 peer decoding
-- Bootstrap nodes
+```bash
+$ cargo run -- inspect ./example.torrent
+Name       : original.bin
+Info hash  : 4ed1e15ff4371567085f1f6cd1757c7edd20c970
+Size       : 204800 bytes
+Piece size : 32768 bytes
+Pieces     : 7
+Trackers   :
+  http://127.0.0.1:18080/announce
+```
 
-### Engineering
-- Modular crate architecture
-- Async I/O
-- Structured logging with `tracing`
-- CLI built with `clap`
-- Unit tests for Bencode, torrent metadata, piece management, and protocol framing
-- End-to-end integration test (`tests/e2e`): builds a torrent, serves a fake
-  HTTP tracker and peer swarm, downloads, and verifies the output byte-for-byte
-- No unsafe Rust
+Download (from the integration test — fake tracker, 3-peer swarm):
 
-## Deliberate scope boundaries
+```bash
+$ ./tests/e2e/run.sh
+Tracker returned 3 peers (interval 1800s)
+Downloaded 204800 bytes; complete=true
 
-This version intentionally does **not** claim support for every BitTorrent BEP. In particular:
+E2E PASS: 204800 bytes, sha256 matches
+```
 
-- HTTPS tracker certificates are handled by Reqwest/Rustls, but tracker behavior is HTTP(S) announce only.
-- Full metadata exchange for magnet links (BEP 9) is not implemented.
-- DHT peer discovery is implemented as a client query path; full routing-table maintenance, token validation, iterative lookup, and peer announcement are future extensions.
-- Extension protocol/message-stream encryption and web seeds are omitted.
-- IPv6 compact peer/DHT support is omitted from the initial implementation.
+Every piece is SHA-1 verified against the torrent's piece hashes before it
+is written; a piece that fails verification is released back for retry
+instead of corrupting the output.
 
-Those boundaries are explicit so the project can be extended without pretending a partial implementation is complete.
+## Architecture
 
-## Build
+```mermaid
+flowchart TD
+    CLI([CLI]) --> TM[Torrent metadata]
+    CLI --> DHT[DHT client]
+    TM --> TR[Tracker<br/>HTTP announce]
+    TR --> PM[Piece manager<br/>rarest-first + claims]
+    DHT --> PM
+    PM --> PS[Peer sessions<br/>Tokio TCP]
+    PS --> ST[Storage<br/>piece assembly]
+```
+
+**Bencode.** A strict decoder/encoder: rejects duplicate dict keys, invalid
+integers (`i03e`, `-0`), and truncated inputs. Dictionaries use ordered
+keys, so re-encoding the `info` dict reproduces the exact bytes the
+info-hash was computed over.
+
+**Tracker.** HTTP(S) announce with `compact=1` peer decoding (plus
+dictionary-model fallback), trying each announce URL in turn. Info-hash and
+peer-id are percent-encoded per the spec.
+
+**Peer protocol.** Handshake validation (protocol string + info-hash match),
+then a request-driven download loop over Tokio TCP: whenever the peer is
+unchoked and holds a piece we need, it is requested immediately — the
+client never stalls waiting for inbound chatter. Messages are
+length-prefixed with a 2 MiB cap; oversized frames are rejected instead of
+being buffered.
+
+**Piece manager.** Tracks per-piece availability from bitfields and `have`
+messages, picks the rarest piece first, and hands out per-piece claims so
+concurrent peer tasks never download the same piece twice. Completed pieces
+are SHA-1 verified.
+
+**DHT.** UDP `get_peers` queries against bootstrap nodes with compact IPv4
+peer decoding. Implemented as a client query path (see scope boundaries).
+
+**Storage.** Preallocates output files, then writes verified pieces at the
+correct offsets; multi-file torrents are mapped across their file list.
+
+## Project layout
+
+```text
+src/main.rs          CLI: inspect / download / dht
+src/lib.rs           crate root, client peer-id prefix
+src/bencode/         strict bencode codec
+src/torrent/         .torrent parsing, info-hash
+src/tracker/         HTTP announce, peer list decoding
+src/peer/            handshake, wire messages, download loop
+src/piece/           rarest-first selection, claims, SHA-1 verification
+src/storage/         preallocation, piece assembly, multi-file mapping
+src/dht/             UDP DHT get_peers client
+tests/e2e/           fake tracker + peer swarm harness (run.sh)
+```
+
+## Build & test
 
 ```bash
 cargo fmt --all -- --check
@@ -65,79 +109,42 @@ cargo build --release
 ./tests/e2e/run.sh
 ```
 
-## Usage
+Unit tests cover bencode round-trips, torrent parsing, piece framing,
+rarest-first selection, and DHT bootstrap handling. The e2e harness builds
+a torrent for a random 200 KiB file, serves it from a fake tracker and
+three fake peers, downloads it with the release binary, and compares the
+output byte-for-byte. No `unsafe` Rust anywhere in the crate.
 
-Inspect a torrent:
+## Deliberate scope boundaries
 
-```bash
-cargo run -- inspect ./ubuntu.torrent
-```
+This version intentionally does **not** claim support for every BitTorrent
+BEP:
 
-Download using tracker-discovered peers:
+- Tracker behavior is HTTP(S) announce only (certificates via rustls).
+- No BEP 9 metadata exchange — magnet links are not supported.
+- DHT is a client query path: no routing-table maintenance, token
+  validation, iterative lookup, or peer announcement yet.
+- No upload seeding or tit-for-tat choking; the client is a leecher.
+- No message-stream encryption, web seeds, or IPv6.
 
-```bash
-cargo run --release -- download ./ubuntu.torrent --output ./downloads --peers 8
-```
+These boundaries are explicit so the project can be extended without
+pretending a partial implementation is complete.
 
-Query DHT for peers for a known info-hash:
+## Roadmap
 
-```bash
-cargo run --release -- dht <40-hex-character-info-hash>
-```
-
-## Architecture
-
-```text
-                  +----------------+
-                  |      CLI       |
-                  +-------+--------+
-                          |
-              +-----------+-----------+
-              |                       |
-        +-----v------+          +-----v------+
-        |   Torrent  |          |     DHT    |
-        |  Metadata  |          | UDP/Kademlia|
-        +-----+------+          +-----+------+
-              |                       |
-        +-----v------+          +-----v------+
-        |  Tracker   |          |   Peers    |
-        | HTTP(S)    |          | discovery  |
-        +-----+------+          +------------+
-              |
-       +------v-------+
-       |  PieceManager |
-       | rarest-first  |
-       +------+--------+
-              |
-       +------v-------+
-       | Peer Sessions |
-       | Tokio/TCP     |
-       +------+--------+
-              |
-       +------v-------+
-       |   Storage     |
-       | files/pieces  |
-       +---------------+
-```
-
-## Suggested next-level extensions
-
-For a research-heavy version, the next additions should be:
-
-1. Full iterative Kademlia routing table with k-buckets and XOR-distance ordering.
+1. Full iterative Kademlia routing table (k-buckets, XOR distance).
 2. BEP 9 metadata exchange for magnet links.
-3. Persistent resume state and bitfield-on-disk.
-4. Endgame mode and duplicate block requests.
-5. Upload seeding and tit-for-tat choking/unchoking.
-6. Tracker announce lifecycle (`started`, periodic, `completed`, `stopped`).
-7. IPv6 and UDP tracker protocol.
-8. Prometheus-style metrics export and benchmark harness.
-9. Property-based tests for the Bencode parser.
-10. Integration tests using a deterministic local tracker and local peer swarm.
+3. Upload seeding with tit-for-tat choking.
+4. Persistent resume state and endgame mode.
+5. Tracker lifecycle (`started`, periodic, `completed`, `stopped`) and UDP
+   trackers.
 
 ## Resume bullet
 
-> Built **Ferrite**, a BitTorrent client in Rust implementing Bencode parsing, tracker-based peer discovery, the BitTorrent peer wire protocol, concurrent piece downloads with rarest-first selection, SHA-1 piece verification, and UDP DHT peer discovery.
+> Built **Ferrite**, a BitTorrent client in Rust implementing bencode
+> parsing, tracker-based peer discovery, the peer wire protocol, concurrent
+> rarest-first downloads with SHA-1 verification, and UDP DHT peer
+> discovery. Verified end-to-end with a fake tracker and peer swarm.
 
 ## License
 
